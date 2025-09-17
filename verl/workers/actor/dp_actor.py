@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import copy
 
 import torch
 from torch import nn
@@ -48,6 +49,104 @@ __all__ = ["DataParallelPPOActor"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+
+import os
+import sys
+
+from loguru import logger
+
+
+_LOGGER = None
+
+
+def log_format(debug: bool = False, rank: int | None = None):
+    if rank is None:
+        prefix = "[XTuner]"
+    else:
+        prefix = f"[XTuner][RANK {rank}]"
+    formatter = f"{prefix}[{{time:YYYY-MM-DD HH:mm:ss}}][<level>{{level}}</level>]"
+
+    if debug:
+        formatter += "[<cyan>{name}</cyan>:"
+        formatter += "<cyan>{function}</cyan>:"
+        formatter += "<cyan>{line}</cyan>]"
+
+    formatter += " <level>{message}</level>"
+    return formatter
+
+
+def get_logger(level="INFO"):
+    global _LOGGER
+    if _LOGGER is None:
+        # Remove the original logger in Python to prevent duplicate printing.
+        log_level = os.environ.get("XTUNER_LOG_LEVEL", level).upper()
+        logger.remove()
+        logger.add(sys.stderr, level=log_level, format=log_format(debug=log_level == "DEBUG"))
+        _LOGGER = logger
+    return _LOGGER
+
+
+logger = get_logger()
+
+
+from safetensors import safe_open
+from torch.distributed.tensor import DTensor
+import json
+class HFCheckpointLoader:
+    def __init__(
+        self,
+        model_path: str,
+        cache_dir: str | None = None,
+        from_hub = "huggingface",
+    ):
+        self.model_path = model_path
+
+        if "model.safetensors.index.json" in os.listdir(self.model_path):
+            index_json = os.path.join(self.model_path, "model.safetensors.index.json")
+            self.weight_map = json.load(open(index_json))["weight_map"]
+            self.use_safetensors = True
+        elif "model.bin.index.json" in os.listdir(self.model_path):
+            index_json = os.path.join(self.model_path, "model.bin.index.json")
+            self.weight_map = json.load(open(index_json))["weight_map"]
+            self.use_safetensors = False
+        elif "model.safetensors" in os.listdir(self.model_path):
+            with safe_open(os.path.join(self.model_path, "model.safetensors"), framework="pt") as f:
+                self.weight_map = {k: "model.safetensors" for k in f.keys()}
+            self.use_safetensors = True
+        else:
+            raise FileNotFoundError
+
+        self._safetensor_cache: dict = {}
+        self.current_file = None
+        self.buffer = None
+
+    def is_key_exist(self, key: str) -> bool:
+        return key in self.weight_map
+
+    def load(self, key) -> torch.Tensor | None:
+        if key not in self.weight_map:
+            return None
+
+        _file = self.weight_map[key]
+
+        if self.use_safetensors:
+            fh_cache_key = os.path.join(self.model_path, _file)
+            if fh_cache_key not in self._safetensor_cache:
+                self._safetensor_cache[fh_cache_key] = safe_open(fh_cache_key, framework="pt")
+            fh = self._safetensor_cache[fh_cache_key]
+            weight = fh.get_tensor(key)
+        else:
+            if self.current_file is None:
+                self.buffer = torch.load(os.path.join(self.model_path, _file))
+                self.current_file = _file
+
+            if _file != self.current_file:
+                self.buffer = torch.load(os.path.join(self.model_path, _file))
+            # TODO: missing typehint
+            weight = self.buffer[key]  # type: ignore
+
+        return weight
+from contextlib import nullcontext
 
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
@@ -86,6 +185,11 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        self._step = 0
+        # self.loader = HFCheckpointLoader('/cpfs01/shared/llm_razor/huanghaian/new_model/Qwen3-8B/')
+
+        logger.add(f"./work_dirs/dapo/train_rank{torch.distributed.get_rank()}.log", format=log_format(), backtrace=True, catch=True)
+
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -97,6 +201,7 @@ class DataParallelPPOActor(BasePPOActor):
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
+        rank = torch.distributed.get_rank()
         if "multi_modal_inputs" in micro_batch.keys():
             if "image_bound" in micro_batch["multi_modal_inputs"][0]:  # minicpm-o logic
                 for key in micro_batch["multi_modal_inputs"][0].keys():
@@ -107,7 +212,27 @@ class DataParallelPPOActor(BasePPOActor):
                         [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
                     )
 
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+        # rank = torch.distributed.get_rank()
+        
+        # def slice_weight(weight):
+        #     dim0 = weight.shape[0]
+        #     assert dim0 % 8 == 0
+        #     chunk_size = dim0 // 8
+        #     return weight[rank * chunk_size : (rank + 1) * chunk_size]
+        # # torch.distributed.breakpoint()
+        # if rank == 0:
+        #     breakpoint()
+        
+        # for name, param in self.actor_module.named_parameters():
+        #     w = self.loader.load(name).float()
+        #     if not isinstance(param, DTensor):
+        #         param.data.copy_(w)
+        #     else:
+        #         param.to_local().data.copy_(slice_weight(w))
+
+
+        # with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+        with nullcontext():
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
@@ -174,6 +299,8 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+                if torch.is_grad_enabled():
+                    os.environ['stop'] = '1'
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -182,6 +309,10 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                if torch.is_grad_enabled():
+                    os.environ['stop'] = '0'
+                # if torch.is_grad_enabled() and torch.distributed.get_rank() == 0:
+                #     breakpoint()
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -361,10 +492,45 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        self._step += 1
+        # # micro_batch_size = data.meta_info["micro_batch_size"]
+        # select_keys = [
+        #     "responses",
+        #     "response_mask",
+        #     "input_ids",
+        #     "attention_mask",
+        #     "position_ids",
+        #     "advantages",
+        # ]
+        # non_tensor_select_keys = []
+        # data_copy = copy.deepcopy(data)
+        # data_copy = data_copy.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+        # micro_batches = data_copy.split(self.config.ppo_mini_batch_size)
+        # p_ids_list = []
+        # r_ids_list = []
+        # adv_list = []
+        # for micro_batch in micro_batches:
+        #     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+        #     for i in range(model_inputs['attention_mask'].shape[0]):
+        #         amask = model_inputs['attention_mask'][i] == 1
+        #         rmask = model_inputs['response_mask'][i] == 1
+        #         ids = model_inputs['input_ids'][i][amask]
+        #         r_ids = model_inputs['responses'][i][rmask]
+        #         p_ids = ids[:-r_ids.shape[0]]
+        #         adv = model_inputs['advantages'][i][rmask]
+        #         p_ids_list.append(p_ids)
+        #         r_ids_list.append(r_ids)
+        #         adv_list.append(adv)
+        # torch.save(p_ids_list, f'trajectory2/step{self._step}_rank{torch.distributed.get_rank()}_prompt.pth')
+        # torch.save(r_ids_list, f'trajectory2/step{self._step}_rank{torch.distributed.get_rank()}_responses.pth')
+        # torch.save(adv_list, f'trajectory2/step{self._step}_rank{torch.distributed.get_rank()}_advantages.pth')
+
         # make sure we are in training mode
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        # temperature = 1.0
 
         select_keys = [
             "responses",
@@ -388,9 +554,15 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        # on_policy = True
+
+        cnt = 0
 
         metrics = {}
+        rank = torch.distributed.get_rank()
         for _ in range(self.config.ppo_epochs):
+            # for _ in range(1):
+            logger.info(f"steps = {len(mini_batches)}")
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -402,11 +574,19 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                logger.info(f"gradient_accumulation = {len(micro_batches)}")
+                breakpoint()
 
                 for micro_batch in micro_batches:
+                # for _ in range(1):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    # cnt += 1
+                    # model_inputs = torch.load(f'trajectory2/step{self._step}_rank{torch.distributed.get_rank()}_model_inputs_{cnt}.pth')
+                    # for key in model_inputs.keys():
+                    #     model_inputs[key] = model_inputs[key]
+
                     response_mask = model_inputs["response_mask"]
                     advantages = model_inputs["advantages"]
 
@@ -483,6 +663,8 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
+                grad_norm = grad_norm * 1
+                logger.info(f"rank {rank} grad_norm: {grad_norm}")
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
