@@ -185,7 +185,7 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
-        self._step = 0
+        self.rollout_step = 0
         # self.loader = HFCheckpointLoader('/cpfs01/shared/llm_razor/huanghaian/new_model/Qwen3-8B/')
 
         logger.add(f"./work_dirs/dapo/train_rank{torch.distributed.get_rank()}.log", format=log_format(), backtrace=True, catch=True)
@@ -489,11 +489,136 @@ class DataParallelPPOActor(BasePPOActor):
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
         return log_probs, entropys
-
+    
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         torch.use_deterministic_algorithms(True, warn_only=True)
-        self._step += 1
+        self.rollout_step += 1
+        # make sure we are in training mode
+        self.actor_module.train()
+
+        cnt = 0
+
+        metrics = {}
+        rank = torch.distributed.get_rank()
+        for _ in range(self.config.ppo_epochs):
+            # logger.info(f"steps = {len(mini_batches)}")
+            for batch_idx in range(16):
+                self.actor_optimizer.zero_grad()
+                pths = []
+                pattern = f'rank{rank}_rollout_step1_step{batch_idx}_'
+                for root, dirs, files in os.walk('/cpfs01/shared/llm_razor/caoweihan/projects/verl/trajectory3'):
+                    for file in files:
+                        if file.endswith('.pth'):
+                            absolute_path = os.path.join(root, file)
+                            if pattern in absolute_path:
+                                pths.append(absolute_path)
+                grad_acc = len(pths)
+                for acc in range(grad_acc):
+                    model_inputs = torch.load(f'/cpfs01/shared/llm_razor/caoweihan/projects/verl/trajectory3/rank{rank}_rollout_step1_step{batch_idx}_acc{acc}_model_inputs.pth', map_location='cuda')
+            # for batch_idx, mini_batch in enumerate(mini_batches):
+            #     if self.config.use_dynamic_bsz:
+            #         max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+            #         micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+            #     else:
+            #         self.gradient_accumulation = (
+            #             self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+            #         )
+            #         micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+            #     self.actor_optimizer.zero_grad()
+            #     logger.info(f"gradient_accumulation = {len(micro_batches)}")
+
+            #     for i, micro_batch in enumerate(micro_batches):
+            #         micro_batch = micro_batch.to(get_device_id())
+                    micro_batch_metrics = {}
+            #         model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            #         torch.save(model_inputs, f'trajectory3/rank{rank}_rollout_step{self.rollout_step}_step{batch_idx}_acc{i}_model_inputs.pth')
+
+                    response_mask = model_inputs["response_mask"]
+                    advantages = model_inputs["advantages"]
+
+                    entropy_coeff = self.config.entropy_coeff
+                    loss_agg_mode = self.config.loss_agg_mode
+
+                    if self.config.use_dynamic_bsz:
+                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    else:
+                        loss_scale_factor = 1 / self.gradient_accumulation
+
+                    # all return: (bsz, response_length)
+                    calculate_entropy = False
+                    if entropy_coeff != 0:
+                        calculate_entropy = True
+                    entropy, log_prob = self._forward_micro_batch(
+                        model_inputs, temperature=1, calculate_entropy=calculate_entropy
+                    )
+
+                    old_log_prob = model_inputs["old_log_probs"]
+
+                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                    policy_loss_fn = get_policy_loss_fn(loss_mode)
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                    )
+
+                    if entropy_coeff != 0:
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                        # compute policy loss
+                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                    else:
+                        policy_loss = pg_loss
+
+                    if self.config.use_kl_loss:
+                        ref_log_prob = model_inputs["ref_log_prob"]
+                        # compute kl loss
+                        kld = kl_penalty(
+                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                        )
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    if self.config.use_dynamic_bsz:
+                        # relative to the dynamic bsz
+                        loss = policy_loss * loss_scale_factor
+                    else:
+                        loss = policy_loss * loss_scale_factor
+                    loss.backward()
+
+                    micro_batch_metrics.update(
+                        {
+                            "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
+                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                            "actor/ppo_kl": ppo_kl.detach().item(),
+                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                        }
+                    )
+                    append_to_dict(metrics, micro_batch_metrics)
+
+                grad_norm = self._optimizer_step()
+                grad_norm = grad_norm * 1
+                logger.info(f"rank {rank} grad_norm: {grad_norm}")
+                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                append_to_dict(metrics, mini_batch_metrics)
+        self.actor_optimizer.zero_grad()
+        return metrics
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def update_policy1(self, data: DataProto):
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        self.rollout_step += 1
         # # micro_batch_size = data.meta_info["micro_batch_size"]
         # select_keys = [
         #     "responses",
@@ -575,13 +700,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
                 logger.info(f"gradient_accumulation = {len(micro_batches)}")
-                breakpoint()
 
-                for micro_batch in micro_batches:
+                for i, micro_batch in enumerate(micro_batches):
                 # for _ in range(1):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    torch.save(model_inputs, f'trajectory3/rank{rank}_rollout_step{self.rollout_step}_step{batch_idx}_acc{i}_model_inputs.pth')
                     # cnt += 1
                     # model_inputs = torch.load(f'trajectory2/step{self._step}_rank{torch.distributed.get_rank()}_model_inputs_{cnt}.pth')
                     # for key in model_inputs.keys():
