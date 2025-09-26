@@ -37,6 +37,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+import time
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -148,6 +149,75 @@ class HFCheckpointLoader:
         return weight
 from contextlib import nullcontext
 
+import torch.nn.functional as F
+
+def gather_logprobs(logits, shifted_labels):
+    logprobs = F.log_softmax(logits, dim=-1)
+    logprobs = logprobs.gather(dim=-1, index=shifted_labels.clip(min=0).unsqueeze(-1)).squeeze(-1)
+    return logprobs
+
+
+def pg_loss_fn1(
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_weights: torch.Tensor,
+    policy_loss_cfg: dict,
+) -> torch.Tensor:
+    cliprange_low = policy_loss_cfg["cliprange_low"]
+    cliprange_high = policy_loss_cfg["cliprange_high"]
+    clip_ratio_c = policy_loss_cfg.get("clip_ratio_c", 10.0)
+
+    advantages = advantages.to(logprobs.dtype)
+
+    negative_approx_kl = logprobs - old_logprobs
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    print(f"========[RATIO] max{ratio.max().item()}, min{ratio.min().item()}, mean{ratio.mean().item()}")
+
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    loss = (pg_losses * loss_weights.to(pg_losses.dtype)).sum()
+    return loss
+
+
+def pg_loss_fn(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_weights: torch.Tensor,
+    policy_loss_cfg: dict,
+) -> torch.Tensor:
+    cliprange_low = policy_loss_cfg["cliprange_low"]
+    cliprange_high = policy_loss_cfg["cliprange_high"]
+    clip_ratio_c = 10.0
+    advantages = advantages.to(log_prob.dtype)
+    negative_approx_kl = log_prob - old_log_prob
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(
+        ratio, 1 - cliprange_low, 1 + cliprange_high
+    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(
+        pg_losses1, pg_losses2
+    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    loss = (pg_losses * loss_weights.to(pg_losses.dtype)).sum()
+    return loss
+
+
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -236,6 +306,7 @@ class DataParallelPPOActor(BasePPOActor):
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
+            # response_mask = micro_batch["response_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
@@ -301,6 +372,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if torch.is_grad_enabled():
                     os.environ['stop'] = '1'
+                # breakpoint()
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -320,18 +392,24 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
+                    # logits_rmpad.div_(temperature)
+                    logits_rmpad = logits_rmpad / temperature
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
-                    log_probs = logprobs_from_logits(
-                        logits=logits_rmpad,
-                        labels=input_ids_rmpad_rolled,
-                        inplace_backward=inplace_backward,
-                    )
-
+                    # log_probs = logprobs_from_logits(
+                    #     logits=logits_rmpad,
+                    #     labels=input_ids_rmpad_rolled,
+                    #     inplace_backward=inplace_backward,
+                    # )
+                    log_probs = gather_logprobs(logits_rmpad.to(torch.float64), input_ids_rmpad_rolled).float()
+                    # if torch.is_grad_enabled():
+                    #     if torch.distributed.get_rank() == 0:
+                    #         breakpoint()
+                    #     else:
+                    #         time.sleep(100000)
                     # compute entropy
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -408,6 +486,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
+            # logger.info(log_probs.dtype)
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -500,14 +579,16 @@ class DataParallelPPOActor(BasePPOActor):
         cnt = 0
 
         metrics = {}
+        all_max_ratios=[]
         rank = torch.distributed.get_rank()
         for _ in range(self.config.ppo_epochs):
             # logger.info(f"steps = {len(mini_batches)}")
             for batch_idx in range(16):
                 self.actor_optimizer.zero_grad()
+                max_ratios = []
                 pths = []
-                pattern = f'rank{rank}_rollout_step1_step{batch_idx}_'
-                for root, dirs, files in os.walk('/cpfs01/shared/llm_razor/caoweihan/projects/verl/trajectory3'):
+                pattern = f'rank{rank}_rollout_step{self.rollout_step}_step{batch_idx}_'
+                for root, dirs, files in os.walk('/mnt/shared-storage-user/caoweihan/projects/verl/trajectory'):
                     for file in files:
                         if file.endswith('.pth'):
                             absolute_path = os.path.join(root, file)
@@ -515,7 +596,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 pths.append(absolute_path)
                 grad_acc = len(pths)
                 for acc in range(grad_acc):
-                    model_inputs = torch.load(f'/cpfs01/shared/llm_razor/caoweihan/projects/verl/trajectory3/rank{rank}_rollout_step1_step{batch_idx}_acc{acc}_model_inputs.pth', map_location='cuda')
+                    model_inputs = torch.load(f'/mnt/shared-storage-user/caoweihan/projects/verl/trajectory/rank{rank}_rollout_step{self.rollout_step}_step{batch_idx}_acc{acc}_model_inputs.pth', map_location='cuda')
             # for batch_idx, mini_batch in enumerate(mini_batches):
             #     if self.config.use_dynamic_bsz:
             #         max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -545,6 +626,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
+                    loss_scale_factor = 1 / grad_acc
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
@@ -561,7 +643,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                    _, pg_clipfrac, ppo_kl, pg_clipfrac_lower, max_ratio = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -569,6 +651,13 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                     )
+                    max_ratios.append(max_ratio.item())
+
+                    old_log_prob_flatten = old_log_prob.flatten()[response_mask.view(-1) != 0]
+                    log_prob_flatten = log_prob.flatten()[response_mask.view(-1) != 0]
+                    advantages_flatten = advantages.flatten()[response_mask.view(-1) != 0]
+                    policy_loss_weight = torch.ones_like(old_log_prob_flatten, dtype=torch.float32) / response_mask.sum()
+                    pg_loss = pg_loss_fn(log_prob_flatten, old_log_prob_flatten, advantages_flatten, policy_loss_weight, {'cliprange_high': 0.28, 'cliprange_low': 0.2, 'loss_type': 'vanilla'})
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -596,6 +685,7 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss * loss_scale_factor
                     loss.backward()
+                    logger.info(f"loss {loss} loss_scale_factor {loss_scale_factor}")
 
                     micro_batch_metrics.update(
                         {
@@ -606,13 +696,21 @@ class DataParallelPPOActor(BasePPOActor):
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)
+                    # if batch_idx == 1 and rank == 6:
+                    #     breakpoint()
 
+                all_max_ratios.append(max_ratios)
                 grad_norm = self._optimizer_step()
                 grad_norm = grad_norm * 1
-                logger.info(f"rank {rank} grad_norm: {grad_norm}")
+                current_lr = self.actor_optimizer.param_groups[0]['lr']
+                logger.info(f"current_lr {current_lr} grad_norm: {grad_norm}")
+                # if rank == 6:
+                #     breakpoint()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        metrics.update({"actor/max_ratio_list": all_max_ratios})
+        # breakpoint()
         return metrics
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -684,6 +782,7 @@ class DataParallelPPOActor(BasePPOActor):
         cnt = 0
 
         metrics = {}
+        all_max_ratios=[]
         rank = torch.distributed.get_rank()
         for _ in range(self.config.ppo_epochs):
             # for _ in range(1):
@@ -699,6 +798,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                max_ratios = []
                 logger.info(f"gradient_accumulation = {len(micro_batches)}")
 
                 for i, micro_batch in enumerate(micro_batches):
@@ -706,7 +806,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    torch.save(model_inputs, f'trajectory3/rank{rank}_rollout_step{self.rollout_step}_step{batch_idx}_acc{i}_model_inputs.pth')
+                    torch.save(model_inputs, f'trajectory/rank{rank}_rollout_step{self.rollout_step}_step{batch_idx}_acc{i}_model_inputs.pth')
                     # cnt += 1
                     # model_inputs = torch.load(f'trajectory2/step{self._step}_rank{torch.distributed.get_rank()}_model_inputs_{cnt}.pth')
                     # for key in model_inputs.keys():
@@ -718,10 +818,10 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    if self.config.use_dynamic_bsz:
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
-                    else:
-                        loss_scale_factor = 1 / self.gradient_accumulation
+                    # if self.config.use_dynamic_bsz:
+                    #     loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                    # else:
+                    loss_scale_factor = 1 / len(micro_batches)
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
@@ -741,7 +841,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                    _, pg_clipfrac, ppo_kl, pg_clipfrac_lower, max_ratio = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -749,6 +849,13 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                     )
+                    max_ratios.append(max_ratio.item())
+
+                    old_log_prob_flatten = old_log_prob.flatten()[response_mask.view(-1) != 0]
+                    log_prob_flatten = log_prob.flatten()[response_mask.view(-1) != 0]
+                    advantages_flatten = advantages.flatten()[response_mask.view(-1) != 0]
+                    policy_loss_weight = torch.ones_like(old_log_prob_flatten, dtype=torch.float32) / response_mask.sum()
+                    pg_loss = pg_loss_fn(log_prob_flatten, old_log_prob_flatten, advantages_flatten, policy_loss_weight, {'cliprange_high': 0.28, 'cliprange_low': 0.2, 'loss_type': 'vanilla'})
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -787,10 +894,12 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
+                all_max_ratios.append(max_ratios)
                 grad_norm = self._optimizer_step()
                 grad_norm = grad_norm * 1
                 logger.info(f"rank {rank} grad_norm: {grad_norm}")
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        metrics.update({"actor/max_ratio_list": all_max_ratios})
         return metrics

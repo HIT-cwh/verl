@@ -3,6 +3,7 @@ set -xeuo pipefail
 
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
 export PYTHONPATH="$(pwd)"
+export FLASH_ATTENTION_DETERMINISTIC='1'
 
 project_name='DAPO'
 exp_name='DAPO-Qwen2.5-7b-MATH-0527a1'
@@ -25,7 +26,7 @@ overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
-train_prompt_bsz=32
+train_prompt_bsz=512
 n_resp_per_prompt=16
 train_prompt_mini_bsz=32
 
@@ -43,10 +44,10 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 # TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
-MODEL_PATH="/cpfs01/shared/llm_ddd/lishuaibin/ckpt/Qwen/Qwen2.5-Math-7B"
+MODEL_PATH="/mnt/shared-storage-user/llmrazor-share/model/Qwen2.5-Math-7B"
 CKPTS_DIR="./ckpts/${project_name}/${exp_name}"
-TRAIN_FILE="/cpfs01/shared/llm_razor/lishuaibin/math_dapo_data/dapo-math-17k.parquet"
-TEST_FILE="/cpfs01/shared/llm_razor/lishuaibin/math_dapo_data/dapo-math-17k.parquet"
+TRAIN_FILE="/mnt/shared-storage-user/caoweihan/data_yidian/dapo-math-17k.parquet"
+TEST_FILE="/mnt/shared-storage-user/caoweihan/data_yidian/dapo-math-17k.parquet"
 
 # Algorithm
 temperature=1.0
@@ -55,7 +56,7 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
 # Performance Related Parameter
-sp_size=4
+sp_size=1
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
@@ -119,7 +120,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.strategy="fsdp2" \
-    actor_rollout_ref.model.use_fused_kernels=True \
+    actor_rollout_ref.model.use_fused_kernels=False \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
@@ -139,4 +140,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
     trainer.log_val_generations=10 \
+    trainer.balance_batch=False \
     2>&1 | tee -a "outputs/dapo.txt"

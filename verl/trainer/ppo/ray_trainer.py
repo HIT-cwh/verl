@@ -65,6 +65,45 @@ from verl.utils.tracking import ValidationGenerationsLogger
 WorkerType = type[Worker]
 
 
+import os
+import sys
+
+from loguru import logger
+
+
+_LOGGER = None
+
+
+def log_format(debug: bool = False, rank: int | None = None):
+    if rank is None:
+        prefix = "[XTuner]"
+    else:
+        prefix = f"[XTuner][RANK {rank}]"
+    formatter = f"{prefix}[{{time:YYYY-MM-DD HH:mm:ss}}][<level>{{level}}</level>]"
+
+    if debug:
+        formatter += "[<cyan>{name}</cyan>:"
+        formatter += "<cyan>{function}</cyan>:"
+        formatter += "<cyan>{line}</cyan>]"
+
+    formatter += " <level>{message}</level>"
+    return formatter
+
+
+def get_logger(level="INFO"):
+    global _LOGGER
+    if _LOGGER is None:
+        # Remove the original logger in Python to prevent duplicate printing.
+        log_level = os.environ.get("XTUNER_LOG_LEVEL", level).upper()
+        logger.remove()
+        logger.add(sys.stderr, level=log_level, format=log_format(debug=log_level == "DEBUG"))
+        _LOGGER = logger
+    return _LOGGER
+
+
+xtuner_logger = get_logger()
+
+
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -238,6 +277,7 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
+    breakpoint()
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
@@ -337,6 +377,7 @@ class RayPPOTrainer:
             device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
         """
 
+        xtuner_logger.add(f"./work_dirs/dapo/trainer.log", format=log_format(), backtrace=True, catch=True)
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.processor = processor
@@ -1260,7 +1301,12 @@ class RayPPOTrainer:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                        grad_norm = actor_output.meta_info["metrics"]['actor/grad_norm']
+                        max_ratio = actor_output.meta_info["metrics"].pop('actor/max_ratio_list')
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update({"grad_norm_list": grad_norm})
+                        metrics.update({"max_ratio_list": max_ratio})
+                        xtuner_logger.info(f"max_ratio_list: {max_ratio}")
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
@@ -1358,6 +1404,10 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
+                print(f"[{self.global_steps}]grad_norm: {metrics['grad_norm_list']}", flush=True)
+                max_ratio_list = metrics['max_ratio_list']
+                for max_ratio in max_ratio_list:
+                    print(f"[{self.global_steps}]max_ratios: {max_ratio}", flush=True)
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)

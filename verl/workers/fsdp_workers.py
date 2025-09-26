@@ -86,6 +86,45 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+import os
+import sys
+
+from loguru import logger as logger_loguru
+
+
+_LOGGER = None
+
+
+def log_format(debug: bool = False, rank: int | None = None):
+    if rank is None:
+        prefix = "[XTuner]"
+    else:
+        prefix = f"[XTuner][RANK {rank}]"
+    formatter = f"{prefix}[{{time:YYYY-MM-DD HH:mm:ss}}][<level>{{level}}</level>]"
+
+    if debug:
+        formatter += "[<cyan>{name}</cyan>:"
+        formatter += "<cyan>{function}</cyan>:"
+        formatter += "<cyan>{line}</cyan>]"
+
+    formatter += " <level>{message}</level>"
+    return formatter
+
+
+def get_logger(level="INFO"):
+    global _LOGGER
+    if _LOGGER is None:
+        # Remove the original logger in Python to prevent duplicate printing.
+        log_level = os.environ.get("XTUNER_LOG_LEVEL", level).upper()
+        logger_loguru.remove()
+        logger_loguru.add(sys.stderr, level=log_level, format=log_format(debug=log_level == "DEBUG"))
+        _LOGGER = logger_loguru
+    return _LOGGER
+
+
+logger_xtuner = get_logger()
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
@@ -726,6 +765,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr
+            logger_xtuner.info(f'lr = {lr}')
             self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics

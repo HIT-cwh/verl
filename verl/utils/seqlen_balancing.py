@@ -273,12 +273,12 @@ def rearrange_micro_batches(
         List[List[int]]: index lists mapping each micro-batch back to original positions.
     """
     # this is per local micro_bsz
-    max_seq_len = batch["attention_mask"].shape[-1]
+    max_seq_len = batch["attention_mask"].shape[-1]  # 8192
     assert max_token_len >= max_seq_len, (
         f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
     )
-    seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
-    total_seqlen = seq_len_effective.sum().item()
+    seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)  # 每条数据实际有多长 (64, 10240)
+    total_seqlen = seq_len_effective.sum().item()  # 所有数据一共多少 token
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
     num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
     if min_num_micro_batch is not None:

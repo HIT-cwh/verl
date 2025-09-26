@@ -14,6 +14,7 @@
 
 from dataclasses import dataclass
 from typing import Optional, Union
+import os
 
 import torch
 from transformers.cache_utils import Cache
@@ -114,6 +115,8 @@ def forward_with_torch_backend(
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
     fused_linear_for_ppo = FusedLinearForPPO()
+    # if torch.distributed.get_rank() == 0 and os.environ.get('stop', '0') == '1':
+    #     breakpoint()
     log_probs, entropy = fused_linear_for_ppo.forward(
         hidden_states=hidden_states,
         vocab_weights=self.lm_head.weight,
