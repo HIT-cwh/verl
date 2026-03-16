@@ -511,6 +511,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
             )
+            print(f'mp_policy = {mp_policy}')
             if role == "actor" and fsdp_config.offload_policy:
                 cpu_offload = CPUOffloadPolicy(pin_memory=True)
                 self._is_offload_param = False

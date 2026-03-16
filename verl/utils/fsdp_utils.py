@@ -503,7 +503,10 @@ def maybe_patch_fsdp_module(model):
     finally:
         fully_shard_module.FSDPModule = orig_fsdp_module
 
-
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper as ptd_checkpoint_wrapper,
+)
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 def apply_fsdp2(model, fsdp_kwargs, config):
     """model: AutoModelForCausalLM"""
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
@@ -525,16 +528,24 @@ def apply_fsdp2(model, fsdp_kwargs, config):
         ):
             modules.append(module)
 
-    for idx, module in enumerate(modules):
-        # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-        #     print(f"wrap module {module.__class__.__name__}")
-        with maybe_patch_fsdp_module(module):
-            fully_shard(module, **fsdp_kwargs)
+    for layer_idx, layer in enumerate(model.model.layers):
+        layer = ptd_checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
+        model.model.layers[layer_idx] = layer
+        fully_shard(layer, **fsdp_kwargs)
+    
+    # for idx, module in enumerate(modules):
+    #     # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+    #     #     print(f"wrap module {module.__class__.__name__}")
+    #     # with maybe_patch_fsdp_module(module):
+    #     # module = ptd_checkpoint_wrapper(module, checkpoint_impl=CheckpointImpl.REENTRANT)
+    #     fully_shard(module, **fsdp_kwargs)
 
     # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
     #     print(f"wrap module {model.__class__.__name__}")
-    with maybe_patch_fsdp_module(model):
-        fully_shard(model, **fsdp_kwargs)  # fsdp2 will not reshard_after_forward for root module
+    # breakpoint()
+
+    # with maybe_patch_fsdp_module(model):
+    fully_shard(model, **fsdp_kwargs)  # fsdp2 will not reshard_after_forward for root module
 
 
 def get_shard_placement_fn(fsdp_size):

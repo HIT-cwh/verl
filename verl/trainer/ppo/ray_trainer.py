@@ -448,6 +448,8 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
+            entry['acc'] = bool(entry['acc'])
+            entry['pred'] = str(entry['pred'])
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
