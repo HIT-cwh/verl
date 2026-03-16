@@ -43,7 +43,7 @@ from sglang.srt.utils import (
     get_ip,
     get_open_port,
     is_cuda,
-    maybe_set_triton_cache_manager,
+    # maybe_set_triton_cache_manager,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
@@ -104,9 +104,9 @@ def _set_envs_and_config(server_args: ServerArgs):
     set_ulimit()
 
     # Fix triton bugs
-    if server_args.tp_size * server_args.dp_size > 1:
-        # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
-        maybe_set_triton_cache_manager()
+    # if server_args.tp_size * server_args.dp_size > 1:
+    #     # FIXME: remove this after https://github.com/triton-lang/triton/pull/4295 is used as a dependency.
+    #     maybe_set_triton_cache_manager()
 
     # Check flashinfer version
     if server_args.attention_backend == "flashinfer":
@@ -464,12 +464,15 @@ class SGLangRollout(BaseRollout):
                 attention_backend="fa3",
                 # In async mode, we want token in token out.
                 skip_tokenizer_init=self.config.mode == "async",
+                log_level='info',
             )
         else:
             self._engine = None
 
         self.sharding_manager = None
         self.is_sleep = True
+        # if self._engine is not None:
+        #     breakpoint()
 
     def _init_sampling_params(self, **kwargs):
         kwargs = dict(
@@ -572,6 +575,7 @@ class SGLangRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        # breakpoint()
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
@@ -630,6 +634,7 @@ class SGLangRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
 
         batch_size = idx.size(0)
+        print(f'batch_size = {batch_size}')
 
         # Extract non-tensor data
         non_tensor_batch = prompts.non_tensor_batch
@@ -708,6 +713,7 @@ class SGLangRollout(BaseRollout):
         # Update with any additional kwargs
         request_sampling_params.update(kwargs)
 
+        # breakpoint()
         if self._tp_rank == 0:
             loop = asyncio.get_event_loop()
             output = loop.run_until_complete(

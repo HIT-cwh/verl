@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
-export PYTHONPATH='.'
+export PYTHONPATH="$(pwd)"
 
 project_name='DAPO'
 exp_name='DAPO-Qwen2.5-7b-MATH-0527a1'
@@ -90,7 +90,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    actor_rollout_ref.rollout.name=sglang \
+    actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -140,4 +140,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.resume_mode=disable \
     trainer.log_val_generations=10 \
     trainer.balance_batch=True \
-    2>&1 | tee -a "outputs/dapo_sglang_1010_2.txt"
+    2>&1 | tee -a "outputs/dapo_vllm_1010.txt"
